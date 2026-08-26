@@ -8,7 +8,7 @@ import datetime
 import tkinter as tk
 from tkinter import ttk
 
-APP_NAME = "mDNS Network Scanner"
+APP_NAME = "NetScanNotebook"
 APP_VERSION = "1.0.6"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 APP_AUTHOR = "Michael Dietz"
@@ -18,11 +18,12 @@ APP_CREDIT = f"Designed by {APP_AUTHOR} · {APP_COMPANY} · {APP_CONTACT}"
 
 RELEASE_NOTES = {
     "version": APP_VERSION,
-    "summary": "Made hostname sources easier to identify in scan results.",
+    "summary": "Project renamed to NetScanNotebook, GUI metadata updated, and hostname protocol labels refined.",
     "changes": [
-        "Added [mDNS], [DNS], and [NetBIOS] labels before discovered hostnames",
-        "Kept each discovered hostname on its own bulleted line",
-        "Retained the rescan warning when another lookup source may provide an additional name",
+        "Renamed main application and repository binaries to NetScanNotebook",
+        "Added explicit [mDNS], [DNS], and [NetBIOS] tags preceding discovered hostnames",
+        "Formatted multi-source hostnames onto clean individual lines",
+        "Retained rescan context notes when secondary resolution sources yield additional names",
     ],
 }
 
