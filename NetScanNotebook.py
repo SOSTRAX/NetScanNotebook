@@ -8,8 +8,10 @@ import datetime
 import tkinter as tk
 from tkinter import ttk
 
+
+
 APP_NAME = "NetScanNotebook"
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 APP_AUTHOR = "Michael Dietz"
 APP_COMPANY = "SOSTRAX"
@@ -20,12 +22,14 @@ RELEASE_NOTES = {
     "version": APP_VERSION,
     "summary": "Project renamed to NetScanNotebook, GUI metadata updated, and hostname protocol labels refined.",
     "changes": [
-        "Renamed main application and repository binaries to NetScanNotebook",
-        "Added explicit [mDNS], [DNS], and [NetBIOS] tags preceding discovered hostnames",
-        "Formatted multi-source hostnames onto clean individual lines",
-        "Retained rescan context notes when secondary resolution sources yield additional names",
+        "Added subprocess.CREATE_NO_WINDOW flags to all Windows subcommands (ping, nbtstat, ipconfig, arp, route) to prevent transient CMD windows from spawning.",
+        "Fixed PyInstaller build instructions to invoke module execution (python -m PyInstaller) bypassing broken legacy global launcher paths.",
+        "Cleaned up unused imports and refined Tkinter theme initialization.",
     ],
 }
+
+# Win32 flag to prevent console windows from popping up during subprocess calls
+CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 # ============================================================
 # Global Settings & Tuning Defaults
@@ -41,8 +45,6 @@ MDNS_DEVICE_DISCOVERY_TIME = 8
 
 COMMON_PORTS = [21, 22, 23, 80, 135, 139, 443, 445, 3389, 8080]
 
-
-
 import ipaddress
 import socket
 import concurrent.futures
@@ -53,26 +55,16 @@ import threading
 import csv
 from collections import Counter
 
-import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog, filedialog
+from tkinter import messagebox, simpledialog, filedialog
 
 # Dependencies are imported after the auto-installer runs.
-
 mac_lookup_engine = None
-
 
 # ============================================================
 # Persistent MAC Mapping Subsystem
 # ============================================================
 
 MAPPING_FILE = "mDNS-NetworkScanner-Mapping.json"
-
-
-
-
-
-
-
 
 REQUIRED_PACKAGES = {
     "zeroconf": "zeroconf",
@@ -97,7 +89,10 @@ def install_missing_packages(splash_window=None, status_label=None):
         print(f"Missing required packages: {', '.join(missing)}")
         print("Automatically installing via pip...")
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", *missing],
+                creationflags=CREATE_NO_WINDOW
+            )
             print("Dependencies successfully installed!\n")
         except Exception as e:
             print(f"Error installing packages automatically: {e}")
@@ -322,9 +317,6 @@ def lookup_saved_note(mac_address, ip_address):
     return ""
 
 
-
-
-
 # ============================================================
 # Layer 3 ICMP Ping Engine
 # ============================================================
@@ -337,7 +329,8 @@ def ping_host(ip_str, cancel_event=None):
         result = subprocess.run(
             ["ping", "-n", "1", "-w", "350", ip_str],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW
         )
         return result.returncode == 0
     except Exception:
@@ -393,7 +386,8 @@ def get_network_adapters():
         capture_output=True,
         text=True,
         encoding="utf-8",
-        errors="replace"
+        errors="replace",
+        creationflags=CREATE_NO_WINDOW
     )
 
     networks = []
@@ -490,19 +484,17 @@ def parse_custom_range(user_input):
     return [ipaddress.ip_address(user_input)]
 
 
-
-
 def prewarm_arp_cache(target_ip):
     """
     Sends an explicit ARP request to pre-populate the local ARP cache 
     and ensure immediate MAC and OUI vendor resolution.
     """
     try:
-        # Send a rapid, lightweight ARP request (timeout 0.5s)
         arp_req = scapy.Ether(dst="ff:ff:ff:ff:ff:ff") / scapy.ARP(pdst=str(target_ip))
         scapy.srp(arp_req, timeout=0.5, verbose=False)
     except Exception:
         pass
+
 
 # ============================================================
 # Hostname, NetBIOS, Live Vendor & Smart Fallback Engine
@@ -525,7 +517,6 @@ def get_scapy_netbios(ip):
                     if name and not name.upper().startswith("WORKGROUP"):
                         collected.append(name)
         if collected:
-            # preserve order and dedupe
             return list(dict.fromkeys(collected))
     except Exception:
         pass
@@ -540,7 +531,8 @@ def get_netbios_name(ip):
             capture_output=True,
             text=True,
             errors="ignore",
-            timeout=1.2
+            timeout=1.2,
+            creationflags=CREATE_NO_WINDOW
         )
 
         names = []
@@ -562,15 +554,11 @@ def get_netbios_name(ip):
     except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
         pass
 
-    # Restored Fallback (may return a list or None)
     return get_scapy_netbios(ip)
 
 
 def resolve_host_info(ip, cancel_event=None):
-    """Resolves DNS and NetBIOS hostname information and returns a list of names.
-
-    Returns an ordered list (dns PTR first, followed by any NetBIOS names).
-    """
+    """Resolves DNS and NetBIOS hostname information and returns a list of names."""
     if cancel_event and cancel_event.is_set():
         return []
 
@@ -582,7 +570,6 @@ def resolve_host_info(ip, cancel_event=None):
     except (socket.herror, socket.gaierror):
         dns_name = None
 
-    # NetBIOS may return a list or None
     netbios_names = get_netbios_name(ip)
     if netbios_names:
         if isinstance(netbios_names, list):
@@ -595,7 +582,6 @@ def resolve_host_info(ip, cancel_event=None):
             if clean_name and clean_name != dns_name:
                 names.append(f"[NetBIOS] {clean_name}")
 
-    # Deduplicate while preserving order
     if names:
         return list(dict.fromkeys(names))
 
@@ -644,7 +630,12 @@ def infer_smart_hostname(mac, open_ports_str):
 
 def get_arp_table():
     """Reads the system ARP cache."""
-    result = subprocess.run(["arp", "-a"], capture_output=True, text=True)
+    result = subprocess.run(
+        ["arp", "-a"],
+        capture_output=True,
+        text=True,
+        creationflags=CREATE_NO_WINDOW
+    )
     arp_devices = {}
     for line in result.stdout.splitlines():
         match = re.search(r"^\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F-]{17})\s+dynamic", line)
@@ -663,7 +654,8 @@ def get_default_gateway_ip():
             capture_output=True,
             text=True,
             encoding="utf-8",
-            errors="replace"
+            errors="replace",
+            creationflags=CREATE_NO_WINDOW
         )
         for line in result.stdout.splitlines():
             if re.search(r"^\s*0\.0\.0\.0\s+\S+\s+(\d+\.\d+\.\d+\.\d+)", line, re.IGNORECASE):
@@ -764,7 +756,6 @@ def mdns_discover(hosts_set, cancel_event=None, status_callback=None):
                 if address not in mdns_devices:
                     mdns_devices[address] = {"hostnames": set(), "services": set()}
 
-                # Normalize and store hostname without trailing dot
                 mdns_devices[address]["hostnames"].add(hostname.rstrip('.'))
                 mdns_devices[address]["services"].add(service_type)
         except Exception:
@@ -833,7 +824,6 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
     hosts_set = set(str(ip) for ip in hosts)
     total = len(hosts)
 
-    # 1. Multi-Threaded ICMP Ping Sweep
     if status_callback:
         status_callback(f"Scanning [Phase 1/5]: Multithreaded ICMP Ping Sweep ({total} targets)...")
 
@@ -854,9 +844,8 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
     if cancel_event and cancel_event.is_set():
         return {}
 
-    # 2. Layer-2 ARP Request Probing via Win32 API
     if status_callback:
-        status_callback(f"Scanning [Phase 2/5]: Win32 Native ARP Probing...")
+        status_callback("Scanning [Phase 2/5]: Win32 Native ARP Probing...")
 
     direct_arp_hits = {}
     completed_arps = 0
@@ -881,7 +870,6 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
     combined_arp = {**system_arp, **direct_arp_hits}
     subnet_arp = {ip: mac for ip, mac in combined_arp.items() if ip in hosts_set}
 
-    # RESTORED: Shared MAC / Proxy Analysis
     gateway_mac = get_default_gateway_mac()
     mac_counts = Counter(subnet_arp.values())
     proxy_macs = set()
@@ -893,7 +881,6 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
         if count >= 3:
             proxy_macs.add(mac)
 
-    # 3. Optional Active mDNS Sweep
     mdns_devices = {}
     if discovery_mode == "thorough" and not (cancel_event and cancel_event.is_set()):
         if status_callback:
@@ -908,7 +895,6 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
         key=ipaddress.ip_address
     )
 
-    # 4. Hostname & NetBIOS Resolution
     if status_callback:
         status_callback(f"Scanning [Phase 4/5]: Resolving hostnames for {len(raw_candidates)} candidate(s)...")
 
@@ -929,7 +915,6 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
     if cancel_event and cancel_event.is_set():
         return {}
 
-    # RESTORED: Ghost Filtering BEFORE Port Scanning
     active_target_ips = []
     for ip in raw_candidates:
         mac = subnet_arp.get(ip, "")
@@ -938,14 +923,12 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
         has_hostname = ip in resolved_hostnames
         has_direct_arp = ip in direct_arp_hits
 
-        # Proxy IPs require independent proof (mDNS, DNS/NetBIOS, or Direct ARP hit)
         if is_proxy:
             if has_mdns or has_hostname or has_direct_arp:
                 active_target_ips.append(ip)
         else:
             active_target_ips.append(ip)
 
-    # 5. TCP Port Scanning (Only Executed Against Validated Targets)
     if status_callback:
         status_callback(f"Scanning [Phase 5/5]: Auditing TCP ports for {len(active_target_ips)} real host(s)...")
 
@@ -964,7 +947,6 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
     if cancel_event and cancel_event.is_set():
         return {}
 
-    # Consolidate Discovery Data
     devices = {}
     for ip in active_target_ips:
         mac = subnet_arp.get(ip, "")
@@ -972,15 +954,12 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
         mdns_names = set(mdns_devices.get(ip, {}).get("hostnames", []))
         open_ports = scanned_ports.get(ip, "None")
 
-        # Build ordered hostname list (mDNS preferred, then DNS/NetBIOS)
         hostname_list = []
         if mdns_names:
-            # deterministic ordering for display
             hostname_list.extend(f"[mDNS] {name}" for name in sorted(mdns_names))
         if dns_netbios_names:
             hostname_list.extend([n for n in dns_netbios_names if n not in hostname_list])
 
-        # Deduplicate while preserving order
         hostname_list = list(dict.fromkeys(hostname_list))
 
         is_proxy_mac = mac in proxy_macs
@@ -988,7 +967,6 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
         real_mac = mac if mac else ""
         vendor = get_vendor_by_mac(real_mac)
 
-        # Choose display hostname. If multiple names exist, show them on separate lines.
         if hostname_list:
             display_hostname = "\n".join(f"• {name}" for name in hostname_list)
         else:
@@ -1017,7 +995,6 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
 
         saved_note = lookup_saved_note(real_mac, ip)
 
-        # Determine vendor string format
         if is_proxy_mac:
             vendor_label = f"{vendor if vendor else 'Unknown Vendor'} [Gateway/Proxy]"
         else:
@@ -1117,7 +1094,6 @@ class NetworkScannerGUI:
         self.setup_styles()
         self.create_widgets()
 
-        # Bind double click for editing notes
         self.tree.bind("<Double-1>", self.on_double_click)
 
         self.tooltip = TreeviewTooltip(self.tree)
@@ -1163,7 +1139,6 @@ class NetworkScannerGUI:
         self.tree.selection_set(item_id)
         values = self.tree.item(item_id, "values")
         
-        # Determine column index clicked (e.g., '#1' -> 0)
         col_index = int(column_id.replace("#", "")) - 1 if column_id else 0
         cell_value = values[col_index] if 0 <= col_index < len(values) else ""
 
@@ -1332,7 +1307,6 @@ class NetworkScannerGUI:
         )
         about_btn.pack(side=tk.RIGHT, padx=(0, 10))
 
-        # 1. Top Configuration Frame
         ctrl_frame = ttk.LabelFrame(self.root, text=" Network Selection & Configuration ", padding=8)
         ctrl_frame.pack(fill=tk.X, padx=10, pady=5)
 
@@ -1393,7 +1367,6 @@ class NetworkScannerGUI:
         ttk.Radiobutton(ctrl_frame, text="Fast Scan (Ping + ARP + NetBIOS + Ports)", variable=self.mode_var, value="fast").grid(row=2, column=1, sticky=tk.W, padx=5, pady=(2, 1))
         ttk.Radiobutton(ctrl_frame, text="Thorough Scan (Fast + Full mDNS)", variable=self.mode_var, value="thorough").grid(row=2, column=2, columnspan=2, sticky=tk.W, padx=(12, 5), pady=(2, 1))
 
-        # Action Buttons Box
         btn_box = ttk.Frame(ctrl_frame)
         btn_box.grid(row=0, column=4, rowspan=3, padx=(10, 0), pady=2, sticky="NW")
 
@@ -1415,11 +1388,9 @@ class NetworkScannerGUI:
         self.stop_btn = ttk.Button(btn_box, text="Stop Scan", style="StopRed.TButton", command=self.stop_scan, state="disabled", width=12)
         self.stop_btn.pack(side=tk.TOP, fill=tk.X, pady=2)
 
-        # 2. Live Search & Filter Bar (unified 50/50 split)
         filter_frame = ttk.Frame(self.root, padding=(8, 3))
         filter_frame.pack(fill=tk.X, padx=10, pady=2)
 
-        # Left half: Search & Filter controls
         search_panel = ttk.Frame(filter_frame)
         search_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -1445,14 +1416,12 @@ class NetworkScannerGUI:
         clear_filter_btn.pack(side=tk.LEFT, padx=5)
         self.bind_widget_tooltip(clear_filter_btn, "Clears the query and resets the column sort order.")
 
-        # Right half: Export controls
         export_panel = ttk.Frame(filter_frame)
         export_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(8, 0))
 
         self.export_btn = ttk.Button(export_panel, text="Export Excel", style="ExportBlue.TButton", command=self.export_to_excel)
         self.export_btn.pack(fill=tk.BOTH, expand=True)
 
-        # 3. Results Table Frame
         tree_frame = ttk.Frame(self.root, padding=10)
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -1499,7 +1468,6 @@ class NetworkScannerGUI:
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
 
-        # 4. Color-Coded Status Bar
         self.status_bar = tk.Label(
             self.root,
             text=" Status: Ready | Reference file: mDNS-NetworkScanner-Mapping.json",
@@ -1513,10 +1481,6 @@ class NetworkScannerGUI:
         self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
     def set_status(self, text, status_type="running"):
-        """
-        Updates status bar background and text.
-        status_type: "running", "stopping", "stopped", "ready"
-        """
         color_map = {
             "running": "#E65100",
             "stopping": "#D97706",
@@ -1548,14 +1512,12 @@ class NetworkScannerGUI:
         self.rescan_btn.config(state="normal" if (self._has_completed_scan and not self.is_scan_running) else "disabled")
 
     def stop_scan(self):
-        """Triggers cancellation event and updates status indicator."""
         if self.is_scan_running:
             self.cancel_event.set()
             self.update_action_button_states()
             self.set_status("Cancellation requested... Waiting for active thread pools to finalize...", status_type="stopping")
 
     def update_sort_indicator(self, column, direction):
-        """Sets a visible ascending/descending arrow on the active sorted column."""
         column_labels = {
             "ip": "IP Address",
             "mac": "MAC Address",
@@ -1578,7 +1540,6 @@ class NetworkScannerGUI:
             self.tree.heading(col_key, text=label + arrow)
 
     def sort_treeview(self, column):
-        """Sort treeview rows by selected column value."""
         items = [(self.tree.set(child, column), child) for child in self.tree.get_children("")]
 
         def sort_key(entry):
@@ -1668,10 +1629,8 @@ class NetworkScannerGUI:
         ).start()
 
     def run_scan(self, hosts, mode):
-        """Executes the network scan in a background thread."""
         gateway_ip = get_default_gateway_ip()
 
-        # Pre-warm the ARP cache for the actual gateway before parsing devices.
         if gateway_ip:
             prewarm_arp_cache(gateway_ip)
 
@@ -1712,7 +1671,6 @@ class NetworkScannerGUI:
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        # Adjust tree row height to fit multi-line hostname entries.
         try:
             max_lines = 1
             for info in merged_results.values():
@@ -1720,7 +1678,6 @@ class NetworkScannerGUI:
                 lines = hn.count('\n') + 1 if hn else 1
                 if lines > max_lines:
                     max_lines = lines
-            # rowheight scaling: base 24 px per single line (matches initial style)
             self.style.configure("Treeview", rowheight=24 * max_lines)
         except Exception:
             pass
@@ -1768,10 +1725,6 @@ class NetworkScannerGUI:
         elif results:
             self.set_status(f"Scan completed successfully. Discovered {len(results)} active host(s). Newly found devices are highlighted in green.", status_type="ready")
 
-    # ============================================================
-    # Live Search & Filter Logic
-    # ============================================================
-
     def clear_filter(self):
         self.filter_query_var.set("")
         self.filter_field_var.set("All Fields")
@@ -1788,7 +1741,6 @@ class NetworkScannerGUI:
         if not source_results:
             return
 
-        # Adjust tree row height to fit multi-line hostname entries in filtered view.
         try:
             max_lines = 1
             for info in source_results.values():
@@ -1942,24 +1894,23 @@ def main():
     splash = show_startup_splash("Please wait, loading libraries...", parent=root)
     splash_window, splash_label = splash
 
-
     def bootstrap_in_background():
+        devnull = None
         try:
             install_missing_packages(splash_window, splash_label)
-            import scapy.all as scapy
-            import time
-
-
 
             global ServiceBrowser, Zeroconf, scapy, MacLookup
 
-            try:
-                from zeroconf import ServiceBrowser, Zeroconf
-                import scapy.all as scapy
-                from mac_vendor_lookup import MacLookup
-            finally:
-                # Restore standard stderr after Scapy import finishes
-                sys.stderr = sys.stderr_bak
+            logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+            os.environ["PYWARN"] = "ignore"
+
+            sys.stderr_bak = sys.stderr
+            devnull = open(os.devnull, 'w')
+            sys.stderr = devnull
+
+            from zeroconf import ServiceBrowser, Zeroconf
+            import scapy.all as scapy
+            from mac_vendor_lookup import MacLookup
 
             initialize_mac_lookup_engine()
 
@@ -1968,29 +1919,13 @@ def main():
             traceback.print_exc()
 
         finally:
+            if hasattr(sys, "stderr_bak"):
+                sys.stderr = sys.stderr_bak
+            if devnull is not None and not devnull.closed:
+                devnull.close()
+
             if splash_window.winfo_exists():
                 splash_window.after(0, lambda: (close_startup_splash(splash_window), root.quit()))
-
-
-
-
-    # ============================================================
-    # Suppress Scapy pcap/libpcap warnings at startup
-    # ============================================================
-    logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
-    os.environ["PYWARN"] = "ignore"
-
-    # Disable Scapy's warning printouts on stdout/stderr before import
-    sys.stderr_bak = sys.stderr
-    sys.stderr = open(os.devnull, 'w')
-
-
-
-
-
-
-
-
 
     startup_thread = threading.Thread(target=bootstrap_in_background, daemon=True)
     startup_thread.start()
@@ -2007,4 +1942,5 @@ def main():
 
 if __name__ == "__main__":
     print(">>> MAIN IS STARTING <<<")
+    print("RUNNING FROM:", os.path.abspath(__file__))
     main()
