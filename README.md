@@ -1,4 +1,4 @@
-# NetScanNotebook
+# NetScanNotebook: Local Subnet Scanner with Persistent Host Notes
 
 [![Download Latest Release](https://img.shields.io/github/v/release/SOSTRAX/NetScanNotebook?style=for-the-badge&logo=github&color=2ea44f&label=Download%20.exe)](https://github.com/SOSTRAX/NetScanNotebook/releases/latest)
 
