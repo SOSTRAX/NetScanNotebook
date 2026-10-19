@@ -7,11 +7,19 @@ import math
 import datetime
 import tkinter as tk
 from tkinter import ttk
-
-
+import ipaddress
+import socket
+import concurrent.futures
+import re
+import time
+import ctypes
+import threading
+import csv
+from collections import Counter
+from tkinter import messagebox, simpledialog, filedialog
 
 APP_NAME = "NetScanNotebook"
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.9"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 APP_AUTHOR = "Michael Dietz"
 APP_COMPANY = "SOSTRAX"
@@ -20,11 +28,12 @@ APP_CREDIT = f"Designed by {APP_AUTHOR} · {APP_COMPANY} · {APP_CONTACT}"
 
 RELEASE_NOTES = {
     "version": APP_VERSION,
-    "summary": "Project renamed to NetScanNotebook, GUI metadata updated, and hostname protocol labels refined.",
+    "summary": "Fixed missing VoIP/Yealink phone detection logic and removed UVNC and CSV file-locking subsystems.",
     "changes": [
-        "Added subprocess.CREATE_NO_WINDOW flags to all Windows subcommands (ping, nbtstat, ipconfig, arp, route) to prevent transient CMD windows from spawning.",
-        "Fixed PyInstaller build instructions to invoke module execution (python -m PyInstaller) bypassing broken legacy global launcher paths.",
-        "Cleaned up unused imports and refined Tkinter theme initialization.",
+        "Removed candidate suppression logic that previously filtered out hosts sharing proxy/gateway MAC addresses.",
+        "Included ICMP ping hits directly into candidate discovery, ensuring devices like Yealink phones are always retained.",
+        "Added SIP ports 5060 and 5061 to default port scanning profiles.",
+        "Removed UVNC dependency checks and CSV file lock validations as requested.",
     ],
 }
 
@@ -43,19 +52,8 @@ PORT_SCAN_WORKERS = 30
 MDNS_SERVICE_DISCOVERY_TIME = 8
 MDNS_DEVICE_DISCOVERY_TIME = 8
 
-COMMON_PORTS = [21, 22, 23, 80, 135, 139, 443, 445, 3389, 8080]
-
-import ipaddress
-import socket
-import concurrent.futures
-import re
-import time
-import ctypes
-import threading
-import csv
-from collections import Counter
-
-from tkinter import messagebox, simpledialog, filedialog
+# Common TCP ports including SIP for VoIP phones
+COMMON_PORTS = [21, 22, 23, 80, 135, 139, 443, 445, 3389, 5060, 5061, 8080]
 
 # Dependencies are imported after the auto-installer runs.
 mac_lookup_engine = None
@@ -343,11 +341,24 @@ def ping_host(ip_str, cancel_event=None):
 
 def send_arp_probe(ip_str, cancel_event=None):
     """
-    Sends a direct Layer 2 ARP request via Windows iphlpapi.dll.
-    Does NOT require Npcap/libpcap drivers to work reliably on Windows.
+    Sends a direct Layer 2 ARP request.
+    Uses Scapy raw Ethernet frames first to mirror Nmap broadcast behavior,
+    falling back to Win32 iphlpapi.dll if necessary.
     """
     if cancel_event and cancel_event.is_set():
         return None
+
+    # Method 1: Scapy Layer 2 Broadcast Frame (Matches Nmap engine)
+    try:
+        arp_request = scapy.ARP(pdst=ip_str)
+        broadcast = scapy.Ether(dst="ff:ff:ff:ff:ff:ff")
+        answered_list = scapy.srp(broadcast / arp_request, timeout=0.8, verbose=False)[0]
+        if answered_list:
+            return answered_list[0][1].hwsrc.upper()
+    except Exception:
+        pass
+
+    # Method 2: Win32 API Fallback
     try:
         inet_addr = socket.inet_aton(ip_str)
         ip_int = ctypes.c_ulong(int.from_bytes(inet_addr, byteorder='little'))
@@ -363,17 +374,7 @@ def send_arp_probe(ip_str, cancel_event=None):
     except Exception:
         pass
 
-    try:
-        arp_request = scapy.ARP(pdst=ip_str)
-        broadcast = scapy.Ether(dst="ff:ff:ff:ff:ff:ff")
-        answered_list = scapy.srp(broadcast / arp_request, timeout=0.5, verbose=False)[0]
-        if answered_list:
-            return answered_list[0][1].hwsrc.upper()
-    except Exception:
-        pass
-
     return None
-
 
 # ============================================================
 # Network Detection & Range Parsing Engine
@@ -610,6 +611,8 @@ def infer_smart_hostname(mac, open_ports_str):
 
     ports = [p.strip() for p in open_ports_str.split(",") if p.strip().isdigit()]
     
+    if "5060" in ports or "5061" in ports:
+        return "[VoIP Phone / SIP Device]"
     if "80" in ports or "443" in ports or "8080" in ports:
         return "[Web/Network Device]"
     if "135" in ports or "139" in ports or "445" in ports or "3389" in ports:
@@ -819,68 +822,108 @@ def scan_open_ports(ip, cancel_event=None):
 # Complete Multi-Layer Scanner Driver
 # ============================================================
 
+def XXXprobe_udp_sip(ip_str, cancel_event=None):
+    """
+    Sends a dummy UDP packet to port 5060 (SIP).
+    VoIP phones will process this at the network layer and immediately
+    populate the host system's ARP table even if TCP/ICMP are disabled.
+    """
+    if cancel_event and cancel_event.is_set():
+        return
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.2)
+            # Simple SIP OPTIONS ping payload
+            sip_payload = (
+                f"OPTIONS sip:{ip_str} SIP/2.0\r\n"
+                f"Via: SIP/2.0/UDP 0.0.0.0:5060;branch=z9hG4bK-netscan\r\n"
+                f"From: <sip:netscan@0.0.0.0>;tag=netscan\r\n"
+                f"To: <sip:{ip_str}>\r\n"
+                f"Call-ID: netscan-{ip_str}\r\n"
+                f"CSeq: 1 OPTIONS\r\n"
+                f"Contact: <sip:netscan@0.0.0.0>\r\n"
+                f"Max-Forwards: 70\r\n\r\n"
+            ).encode("utf-8")
+            s.sendto(sip_payload, (ip_str, 5060))
+    except Exception:
+        pass
+
+
 def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_event=None):
     hosts = list(hosts)
-    hosts_set = set(str(ip) for ip in hosts)
+    hosts_str_list = [str(ip) for ip in hosts]
+    hosts_set = set(hosts_str_list)
     total = len(hosts)
 
+    # ------------------------------------------------------------
+    # Phase 1: Scapy Raw Layer-2 Broadcast ARP Sweep (Nmap Parity)
+    # ------------------------------------------------------------
     if status_callback:
-        status_callback(f"Scanning [Phase 1/5]: Multithreaded ICMP Ping Sweep ({total} targets)...")
+        status_callback(f"Scanning [Phase 1/5]: Raw Layer-2 ARP Broadcast Sweep ({total} targets)...")
+
+    arp_hits = {}
+    try:
+        # Determine target subnet range string (e.g. 192.168.8.0/24 or range)
+        first_ip = str(hosts[0])
+        last_ip = str(hosts[-1])
+        if len(hosts) > 1:
+            target_spec = f"{first_ip}-{last_ip.split('.')[-1]}"
+        else:
+            target_spec = first_ip
+
+        # Perform Scapy broadcast ARP scan directly matching Nmap engine behavior
+        ans, _ = scapy.arping(target_spec, verbose=False, timeout=1.5)
+        for sent, received in ans:
+            if cancel_event and cancel_event.is_set():
+                break
+            arp_hits[received.psrc] = received.hwsrc.upper()
+    except Exception:
+        pass
+
+    if cancel_event and cancel_event.is_set():
+        return {}
+
+    # ------------------------------------------------------------
+    # Phase 2: Win32 Fallback + ICMP Ping Sweep
+    # ------------------------------------------------------------
+    if status_callback:
+        status_callback("Scanning [Phase 2/5]: Native Win32 ARP & ICMP Ping Sweep...")
 
     ping_hits = set()
-    completed_pings = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=PING_WORKERS) as executor:
-        futures = {executor.submit(ping_host, str(ip), cancel_event): str(ip) for ip in hosts}
-        for future in concurrent.futures.as_completed(futures):
-            if cancel_event and cancel_event.is_set():
-                break
-            ip = futures[future]
-            completed_pings += 1
-            if future.result():
-                ping_hits.add(ip)
-            if status_callback and completed_pings % 15 == 0:
-                status_callback(f"Scanning [Phase 1/5]: ICMP Ping {completed_pings}/{total} ({completed_pings/total*100:.0f}%)")
-
-    if cancel_event and cancel_event.is_set():
-        return {}
-
-    if status_callback:
-        status_callback("Scanning [Phase 2/5]: Win32 Native ARP Probing...")
-
     direct_arp_hits = {}
-    completed_arps = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=ARP_WORKERS) as executor:
-        futures = {executor.submit(send_arp_probe, str(ip), cancel_event): str(ip) for ip in hosts}
+    completed_probes = 0
+
+    def probe_fallback(ip_str):
+        if cancel_event and cancel_event.is_set():
+            return
+        # Win32 Direct ARP
+        mac = send_arp_probe(ip_str, cancel_event)
+        if mac:
+            direct_arp_hits[ip_str] = mac
+        # ICMP Ping
+        if ping_host(ip_str, cancel_event):
+            ping_hits.add(ip_str)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=PING_WORKERS) as executor:
+        futures = {executor.submit(probe_fallback, str(ip)): str(ip) for ip in hosts}
         for future in concurrent.futures.as_completed(futures):
             if cancel_event and cancel_event.is_set():
                 break
-            ip = futures[future]
-            completed_arps += 1
-            try:
-                mac = future.result()
-                if mac:
-                    direct_arp_hits[ip] = mac
-            except Exception:
-                pass
+            completed_probes += 1
+            if status_callback and completed_probes % 25 == 0:
+                status_callback(f"Scanning [Phase 2/5]: Probing {completed_probes}/{total} ({completed_probes/total*100:.0f}%)")
 
     if cancel_event and cancel_event.is_set():
         return {}
 
+    # Consolidate all ARP tables
     system_arp = get_arp_table()
-    combined_arp = {**system_arp, **direct_arp_hits}
+    combined_arp = {**system_arp, **direct_arp_hits, **arp_hits}
     subnet_arp = {ip: mac for ip, mac in combined_arp.items() if ip in hosts_set}
 
-    gateway_mac = get_default_gateway_mac()
-    mac_counts = Counter(subnet_arp.values())
-    proxy_macs = set()
-    
-    if gateway_mac:
-        proxy_macs.add(gateway_mac)
-        
-    for mac, count in mac_counts.items():
-        if count >= 3:
-            proxy_macs.add(mac)
-
+    # ------------------------------------------------------------
+    # Phase 3: mDNS Discovery
+    # ------------------------------------------------------------
     mdns_devices = {}
     if discovery_mode == "thorough" and not (cancel_event and cancel_event.is_set()):
         if status_callback:
@@ -890,13 +933,17 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
     if cancel_event and cancel_event.is_set():
         return {}
 
+    # Collect ALL raw candidate IP hits across Layer 2 and Layer 3
     raw_candidates = sorted(
-        list(set(subnet_arp.keys()) | set(mdns_devices.keys()) | set(direct_arp_hits.keys())),
+        list(set(subnet_arp.keys()) | set(mdns_devices.keys()) | set(ping_hits)),
         key=ipaddress.ip_address
     )
 
+    # ------------------------------------------------------------
+    # Phase 4: Resolving Hostnames
+    # ------------------------------------------------------------
     if status_callback:
-        status_callback(f"Scanning [Phase 4/5]: Resolving hostnames for {len(raw_candidates)} candidate(s)...")
+        status_callback(f"Scanning [Phase 4/5]: Resolving hostnames for {len(raw_candidates)} host(s)...")
 
     resolved_hostnames = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=HOSTNAME_WORKERS) as executor:
@@ -915,26 +962,15 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
     if cancel_event and cancel_event.is_set():
         return {}
 
-    active_target_ips = []
-    for ip in raw_candidates:
-        mac = subnet_arp.get(ip, "")
-        is_proxy = mac in proxy_macs
-        has_mdns = ip in mdns_devices
-        has_hostname = ip in resolved_hostnames
-        has_direct_arp = ip in direct_arp_hits
-
-        if is_proxy:
-            if has_mdns or has_hostname or has_direct_arp:
-                active_target_ips.append(ip)
-        else:
-            active_target_ips.append(ip)
-
+    # ------------------------------------------------------------
+    # Phase 5: Audit TCP Ports
+    # ------------------------------------------------------------
     if status_callback:
-        status_callback(f"Scanning [Phase 5/5]: Auditing TCP ports for {len(active_target_ips)} real host(s)...")
+        status_callback(f"Scanning [Phase 5/5]: Auditing TCP ports for {len(raw_candidates)} discovered host(s)...")
 
     scanned_ports = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=PORT_SCAN_WORKERS) as executor:
-        futures = {executor.submit(scan_open_ports, ip, cancel_event): ip for ip in active_target_ips}
+        futures = {executor.submit(scan_open_ports, ip, cancel_event): ip for ip in raw_candidates}
         for future in concurrent.futures.as_completed(futures):
             if cancel_event and cancel_event.is_set():
                 break
@@ -947,8 +983,13 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
     if cancel_event and cancel_event.is_set():
         return {}
 
+    # ------------------------------------------------------------
+    # Build Result Device Map
+    # ------------------------------------------------------------
     devices = {}
-    for ip in active_target_ips:
+    gateway_mac = get_default_gateway_mac()
+
+    for ip in raw_candidates:
         mac = subnet_arp.get(ip, "")
         dns_netbios_names = resolved_hostnames.get(ip, [])
         mdns_names = set(mdns_devices.get(ip, {}).get("hostnames", []))
@@ -961,8 +1002,6 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
             hostname_list.extend([n for n in dns_netbios_names if n not in hostname_list])
 
         hostname_list = list(dict.fromkeys(hostname_list))
-
-        is_proxy_mac = mac in proxy_macs
 
         real_mac = mac if mac else ""
         vendor = get_vendor_by_mac(real_mac)
@@ -982,7 +1021,7 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
         methods = []
         if ip in ping_hits:
             methods.append("ICMP Ping")
-        if ip in direct_arp_hits:
+        if ip in arp_hits or ip in direct_arp_hits:
             methods.append("ARP Direct")
         elif mac:
             methods.append("ARP Cache")
@@ -995,7 +1034,7 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
 
         saved_note = lookup_saved_note(real_mac, ip)
 
-        if is_proxy_mac:
+        if gateway_mac and mac == gateway_mac:
             vendor_label = f"{vendor if vendor else 'Unknown Vendor'} [Gateway/Proxy]"
         else:
             vendor_label = vendor if vendor else "Unknown Vendor"
@@ -1012,8 +1051,7 @@ def scan_network_gui(hosts, discovery_mode="fast", status_callback=None, cancel_
         }
 
     return devices
-
-
+    
 # ============================================================
 # Graphical User Interface (Tkinter)
 # ============================================================
@@ -1419,7 +1457,7 @@ class NetworkScannerGUI:
         export_panel = ttk.Frame(filter_frame)
         export_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(8, 0))
 
-        self.export_btn = ttk.Button(export_panel, text="Export Excel", style="ExportBlue.TButton", command=self.export_to_excel)
+        self.export_btn = ttk.Button(export_panel, text="Export Excel/CSV", style="ExportBlue.TButton", command=self.export_to_excel)
         self.export_btn.pack(fill=tk.BOTH, expand=True)
 
         tree_frame = ttk.Frame(self.root, padding=10)
@@ -1829,8 +1867,8 @@ class NetworkScannerGUI:
             return
 
         file_path = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Excel Spreadsheet", "*.xlsx"), ("CSV File", "*.csv")],
+            defaultextension=".csv",
+            filetypes=[("CSV File", "*.csv"), ("Excel Spreadsheet", "*.xlsx")],
             title="Export Scan Results"
         )
 
